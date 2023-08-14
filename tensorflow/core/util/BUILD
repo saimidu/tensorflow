@@ -12,6 +12,7 @@ load(
     "tf_cc_test",
     "tf_cc_test_mkl",
     "tf_cc_tests",
+    "tf_cc_test_mkl",
     "tf_copts",
     "tf_cuda_library",
     "tf_cuda_only_cc_test",

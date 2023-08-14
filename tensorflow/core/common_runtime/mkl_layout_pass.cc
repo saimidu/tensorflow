@@ -1813,6 +1813,68 @@ class MklLayoutRewritePass : public GraphOptimizationPass {
     return (total_mflops < 0 || total_mflops >= thr);
   }
 
+#ifdef DNNL_AARCH64_USE_ACL
+  static bool MatMulHeuristic(const Node* n) {
+    // Check if we can obtain dimensions for this node.
+    std::vector<const TensorShapeProto*> shape_attrs;
+    if (!TryGetNodeAttr(n->attrs(), "_input_shapes", &shape_attrs)) {
+      // We can't obtain shape so we will revert to default behaviour
+      // to rewrite node.
+      return -1;
+    }
+
+    if ((n->type_string() == "MatMul" || n->type_string() == "_FusedMatMul")) {
+      TensorShape lhs_shape, rhs_shape;
+      if (TensorShape::BuildTensorShape(*shape_attrs[0], &lhs_shape) !=
+          tsl::OkStatus()) {
+        return -1;
+      }
+      if (TensorShape::BuildTensorShape(*shape_attrs[1], &rhs_shape) !=
+          tsl::OkStatus()) {
+        return -1;
+      }
+
+      auto M = lhs_shape.dim_size(0);
+      auto K = lhs_shape.dim_size(1);
+      auto N = rhs_shape.dim_size(1);
+      auto ops = M * N * K;
+      std::array<int, 3> n_threshold = {7560, 250, 1536};
+      std::array<int, 2> m_threshold = {378, 80};
+      std::array<int, 2> ops_threshold = {5242880, 1090519040};
+       if (N <= n_threshold.at(0)) {
+        if (ops <= ops_threshold.at(0)) {
+          if (M <= m_threshold.at(0)) {
+            return 0;
+          } else {
+            if (N <= n_threshold.at(1)) {
+              return 0;
+            } else {
+              return -1;
+            }
+          }
+        } else {
+          if (M <= m_threshold.at(1)) {
+            if (N <= n_threshold.at(2)) {
+              return -1;
+            } else {
+              return 0;
+            }
+          } else {
+            if (ops <= ops_threshold.at(1)) {
+              return -1;
+            } else {
+              return 0;
+            }
+          }
+        }
+      } else {
+        return 0;
+      }
+    }
+    return -1;
+  }
+ #endif
+
   static bool FusedConv2DRewrite(const Node* n, int threads) {
     // Decide whether it is worth rewriting it to oneDNN operation
     // due to overheads as they will dominate for small shapes.

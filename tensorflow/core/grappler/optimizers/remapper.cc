@@ -3273,6 +3273,7 @@ Status AddFusedContractionNode(RemapperContext* ctx,
   } else if (IsMatMul(contraction)) {
     AddInputShapesAttr(*ctx, matched.contraction);
     contraction_node.set_op(kFusedMatMul);
+    AddInputShapesAttr(*ctx, matched.contraction);
     CopyMatMulAttributes(contraction, &contraction_node);
   } else if (IsConv3D(contraction)) {
     contraction_node.set_op(kFusedConv3D);
@@ -4467,6 +4468,8 @@ Status Remapper::Optimize(Cluster* cluster, const GrapplerItem& item,
       ctx.graph_view.SortTopologically(/*ignore_cycles=*/false, {}));
 
   const int num_nodes = item.graph.node_size();
+  const int intra_op_parallelism_threads =
+      item.optimization_options().intra_op_parallelism_threads;
   // Skip nodes that were invalidated by a remapper, e.g. do not process BiasAdd
   // and Activation nodes that were fused into a Conv2D node.
   std::vector<bool> invalidated_nodes(num_nodes);
