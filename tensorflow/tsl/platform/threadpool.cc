@@ -27,6 +27,7 @@ limitations under the License.
 #include "tensorflow/tsl/platform/numa.h"
 #include "tensorflow/tsl/platform/setround.h"
 #include "tensorflow/tsl/platform/tracing.h"
+#include <thread>
 
 #ifdef TENSORFLOW_THREADSCALING_EXPERIMENTAL
 ABSL_FLAG(float, tensorflow_num_threads_scale_factor, 1.0,
@@ -106,6 +107,10 @@ ThreadPool::ThreadPool(Env* env, const ThreadOptions& thread_options,
                        const string& name, int num_threads,
                        bool low_latency_hint, Eigen::Allocator* allocator) {
   CHECK_GE(num_threads, 1);
+
+if(num_threads == std::thread::hardware_concurrency() && num_threads > 1){
+  num_threads = num_threads - 1;
+}
 
 #ifdef TENSORFLOW_THREADSCALING_EXPERIMENTAL
   CHECK_GT(absl::GetFlag(FLAGS_tensorflow_num_threads_scale_factor), 0);

@@ -1,0 +1,624 @@
+ *******************************************************************************
+ Copyright 2023 Arm Limited and affiliates.
+ SPDX-License-Identifier: Apache-2.0
+
+ Licensed under the Apache License, Version 2.0 (the "License");
+ you may not use this file except in compliance with the License.
+ You may obtain a copy of the License at
+
+     http://www.apache.org/licenses/LICENSE-2.0
+
+ Unless required by applicable law or agreed to in writing, software
+ distributed under the License is distributed on an "AS IS" BASIS,
+ WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ See the License for the specific language governing permissions and
+ limitations under the License.
+ *******************************************************************************
+diff --git a/src/core/NEON/kernels/NEReorderKernel.cpp b/src/core/NEON/kernels/NEReorderKernel.cpp
+index 1a7f58bb0..8c9febcd2 100644
+--- a/src/core/NEON/kernels/NEReorderKernel.cpp
++++ b/src/core/NEON/kernels/NEReorderKernel.cpp
+@@ -53,14 +53,42 @@ void NEReorderKernel::run(const Window &window, const ThreadInfo &info)
+                 {
+                     case WeightFormat::OHWIo4:
+                     {
+-                        arm_gemm::Transform<4, 1, true, arm_gemm::VLType::None>(reinterpret_cast<float *>(_output->buffer()) + jump_rows, reinterpret_cast<float *>(_input->buffer()), stride, k_start, k_end, 0, _xmax);
+-                        break;
++                        switch (_output->info()->data_type())
++                        {
++                            case DataType::F32:
++                                arm_gemm::Transform<4, 1, true, arm_gemm::VLType::None>(
++                                    reinterpret_cast<float *>(_output->buffer()) + jump_rows,
++                                    reinterpret_cast<float *>(_input->buffer()), stride, k_start, k_end, 0, _xmax);
++                                break;
++                            case DataType::BFLOAT16:
++                                arm_gemm::Transform<4, 4, true, arm_gemm::VLType::None>(
++                                    reinterpret_cast<bfloat16 *>(_output->buffer()) + jump_rows,
++                                    reinterpret_cast<float *>(_input->buffer()), stride, k_start, k_end, 0, _xmax);
++                                break;
++                            default:
++                                ARM_COMPUTE_ERROR("Unsupported data type!");
++                        }
++			                   break;
+                     }
+ #if defined(ARM_COMPUTE_ENABLE_SVE)
+                     case WeightFormat::OHWIo8:
+                     {
+-                        arm_gemm::Transform<1, 1, true, arm_gemm::VLType::SVE>(reinterpret_cast<float *>(_output->buffer()) + jump_rows, reinterpret_cast<float *>(_input->buffer()), stride, k_start, k_end, 0, _xmax);
+-                        break;
++                        switch (_output->info()->data_type())
++                        {
++                            case DataType::F32:
++                                arm_gemm::Transform<1, 1, true, arm_gemm::VLType::SVE>(
++                                    reinterpret_cast<float *>(_output->buffer()) + jump_rows,
++                                    reinterpret_cast<float *>(_input->buffer()), stride, k_start, k_end, 0, _xmax);
++                                break;
++                            case DataType::BFLOAT16:
++                                arm_gemm::Transform<2, 4, true, arm_gemm::VLType::SVE>(
++                                    reinterpret_cast<bfloat16 *>(_output->buffer()) + jump_rows,
++                                    reinterpret_cast<float *>(_input->buffer()), stride, k_start, k_end, 0, _xmax);
++                                break;
++                            default:
++                                ARM_COMPUTE_ERROR("Unsupported data type!");
++                        }
++			                   break;
+                     }
+ #endif /* ARM_COMPUTE_ENABLE_SVE */
+                     default:
+@@ -158,7 +186,8 @@ Status NEReorderKernel::validate(const ITensorInfo *input, const ITensorInfo *ou
+     ARM_COMPUTE_RETURN_ERROR_ON(input->data_type() == DataType::UNKNOWN);
+     if(output->tensor_shape().total_size() != 0)
+     {
+-        ARM_COMPUTE_RETURN_ERROR_ON_MISMATCHING_DATA_TYPES(input, output);
++        if (!(input->data_type() == DataType::F32 && output->data_type() == DataType::BFLOAT16))
++            ARM_COMPUTE_RETURN_ERROR_ON_MISMATCHING_DATA_TYPES(input, output);
+         ARM_COMPUTE_RETURN_ERROR_ON_MISMATCHING_QUANTIZATION_INFO(input, output);
+         // Only input WeightFormat OHWI supported
+         ARM_COMPUTE_RETURN_ERROR_ON(input_wf != arm_compute::WeightFormat::OHWI);
+--
+2.34.1
+diff --git a/src/core/NEON/kernels/arm_gemm/transforms/a64_transpose_interleave_4_2x4_fp32bf16.hpp b/src/core/NEON/kernels/arm_gemm/transforms/a64_transpose_interleave_4_2x4_fp32bf16.hpp
+new file mode 100644
+index 0000000..81024ca
+--- /dev/null
++++ b/src/core/NEON/kernels/arm_gemm/transforms/a64_transpose_interleave_4_2x4_fp32bf16.hpp
+@@ -0,0 +1,346 @@
++/*
++ * Copyright (c) 2023 Arm Limited.
++ *
++ * SPDX-License-Identifier: MIT
++ *
++ * Permission is hereby granted, free of charge, to any person obtaining a copy
++ * of this software and associated documentation files (the "Software"), to
++ * deal in the Software without restriction, including without limitation the
++ * rights to use, copy, modify, merge, publish, distribute, sublicense, and/or
++ * sell copies of the Software, and to permit persons to whom the Software is
++ * furnished to do so, subject to the following conditions:
++ *
++ * The above copyright notice and this permission notice shall be included in all
++ * copies or substantial portions of the Software.
++ *
++ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
++ * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
++ * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
++ * AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
++ * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
++ * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
++ * SOFTWARE.
++ */
++
++#pragma once
++
++#if defined(__aarch64__)
++
++namespace {
++
++void a64_transpose_interleave_4_2x4_fp32bf16(bfloat16 *out, const float *in, size_t width, size_t in_stride, size_t height)
++{
++    float *pad_row = reinterpret_cast<float *>(alloca(width * sizeof(float)));
++
++    if (height % 4) {
++        memset(pad_row, 0, width * sizeof(float));
++    }
++
++    size_t out_stride = 4 * roundup<size_t>(height, 4) * sizeof(bfloat16);
++
++    __asm__ __volatile__(
++      "cmp %x[height], #0x8\n"
++      "blt 8f\n"
++      "1:"  // Main row loop: Head
++      "mov x9, %x[in]\n"
++      "mov x28, %x[width]\n"
++      "mov x27, %x[out]\n"
++      "sub %x[height], %x[height], #0x8\n"
++      "add x26, x9, %x[in_stride]\n"
++      "add x25, x26, %x[in_stride]\n"
++      "add x24, x25, %x[in_stride]\n"
++      "cmp x28, #0x8\n"
++      "add x23, x24, %x[in_stride]\n"
++      "add x22, x23, %x[in_stride]\n"
++      "add x21, x22, %x[in_stride]\n"
++      "add x20, x21, %x[in_stride]\n"
++      "add %x[in], x20, %x[in_stride]\n"
++      "blt 3f\n"
++      "2:"  // Main row loop: Unroll column loop
++      "ldr q19, [x9], #0x10\n"
++      "ldr q18, [x26], #0x10\n"
++      "sub x28, x28, #0x8\n"
++      "ldr q17, [x25], #0x10\n"
++      "ldr q16, [x24], #0x10\n"
++      "cmp x28, #0x8\n"
++      "ldr q1, [x23], #0x10\n"
++      "ldr q0, [x22], #0x10\n"
++      "ldr q31, [x21], #0x10\n"
++      "ldr q24, [x20], #0x10\n"
++      "ldr q23, [x9], #0x10\n"
++      "ldr q22, [x26], #0x10\n"
++      "zip1 v30.4s, v19.4s, v17.4s\n"
++      "zip1 v29.4s, v18.4s, v16.4s\n"
++      "ldr q21, [x25], #0x10\n"
++      "ldr q20, [x24], #0x10\n"
++      "zip2 v28.4s, v19.4s, v17.4s\n"
++      "zip2 v27.4s, v18.4s, v16.4s\n"
++      "ldr q19, [x23], #0x10\n"
++      "ldr q18, [x22], #0x10\n"
++      "zip1 v26.4s, v1.4s, v31.4s\n"
++      "zip1 v25.4s, v0.4s, v24.4s\n"
++      "ldr q17, [x21], #0x10\n"
++      "ldr q16, [x20], #0x10\n"
++      "zip2 v8.4s, v1.4s, v31.4s\n"
++      "zip2 v24.4s, v0.4s, v24.4s\n"
++      "zip1 v7.4s, v23.4s, v21.4s\n"
++      "zip1 v6.4s, v22.4s, v20.4s\n"
++      "zip2 v5.4s, v23.4s, v21.4s\n"
++      "zip2 v4.4s, v22.4s, v20.4s\n"
++      "zip1 v3.4s, v19.4s, v17.4s\n"
++      "zip1 v2.4s, v18.4s, v16.4s\n"
++      "zip2 v1.4s, v19.4s, v17.4s\n"
++      "zip2 v0.4s, v18.4s, v16.4s\n"
++      "zip1 v23.4s, v30.4s, v29.4s\n"
++      "zip1 v22.4s, v28.4s, v27.4s\n"
++      "zip1 v21.4s, v26.4s, v25.4s\n"
++      "zip1 v20.4s, v8.4s, v24.4s\n"
++      "zip1 v19.4s, v7.4s, v6.4s\n"
++      "zip1 v18.4s, v5.4s, v4.4s\n"
++      "zip1 v17.4s, v3.4s, v2.4s\n"
++      "zip1 v16.4s, v1.4s, v0.4s\n"
++      ".inst 0x0ea16aff  // bfcvtn v31.4h, v23.4s\n"
++      "zip2 v30.4s, v30.4s, v29.4s\n"
++      ".inst 0x0ea16add  // bfcvtn v29.4h, v22.4s\n"
++      "zip2 v28.4s, v28.4s, v27.4s\n"
++      ".inst 0x0ea16abb  // bfcvtn v27.4h, v21.4s\n"
++      "zip2 v26.4s, v26.4s, v25.4s\n"
++      ".inst 0x0ea16a99  // bfcvtn v25.4h, v20.4s\n"
++      "zip2 v24.4s, v8.4s, v24.4s\n"
++      ".inst 0x0ea16a77  // bfcvtn v23.4h, v19.4s\n"
++      "zip2 v22.4s, v7.4s, v6.4s\n"
++      ".inst 0x0ea16a55  // bfcvtn v21.4h, v18.4s\n"
++      "zip2 v20.4s, v5.4s, v4.4s\n"
++      ".inst 0x0ea16a33  // bfcvtn v19.4h, v17.4s\n"
++      "zip2 v18.4s, v3.4s, v2.4s\n"
++      ".inst 0x0ea16a11  // bfcvtn v17.4h, v16.4s\n"
++      "zip2 v16.4s, v1.4s, v0.4s\n"
++      ".inst 0x4ea16bdf  // bfcvtn2 v31.8h, v30.4s\n"
++      ".inst 0x4ea16b9d  // bfcvtn2 v29.8h, v28.4s\n"
++      ".inst 0x4ea16b5b  // bfcvtn2 v27.8h, v26.4s\n"
++      ".inst 0x4ea16b19  // bfcvtn2 v25.8h, v24.4s\n"
++      ".inst 0x4ea16ad7  // bfcvtn2 v23.8h, v22.4s\n"
++      ".inst 0x4ea16a95  // bfcvtn2 v21.8h, v20.4s\n"
++      "str q31, [x27, #0x0]\n"
++      "str q29, [x27, #0x10]\n"
++      ".inst 0x4ea16a53  // bfcvtn2 v19.8h, v18.4s\n"
++      ".inst 0x4ea16a11  // bfcvtn2 v17.8h, v16.4s\n"
++      "str q27, [x27, #0x20]\n"
++      "str q25, [x27, #0x30]\n"
++      "add x27, x27, %x[out_stride]\n"
++      "str q23, [x27, #0x0]\n"
++      "str q21, [x27, #0x10]\n"
++      "str q19, [x27, #0x20]\n"
++      "str q17, [x27, #0x30]\n"
++      "add x27, x27, %x[out_stride]\n"
++      "bge 2b\n"
++      "3:"  // Main row loop: Unroll column loop skip
++      "cmp x28, #0x4\n"
++      "blt 5f\n"
++      "4:"  // Main row loop: Column loop
++      "ldr q25, [x9], #0x10\n"
++      "ldr q24, [x26], #0x10\n"
++      "sub x28, x28, #0x4\n"
++      "ldr q21, [x25], #0x10\n"
++      "ldr q20, [x24], #0x10\n"
++      "cmp x28, #0x4\n"
++      "ldr q23, [x23], #0x10\n"
++      "ldr q19, [x22], #0x10\n"
++      "ldr q18, [x21], #0x10\n"
++      "ldr q17, [x20], #0x10\n"
++      "zip1 v22.4s, v25.4s, v21.4s\n"
++      "zip1 v16.4s, v24.4s, v20.4s\n"
++      "zip2 v21.4s, v25.4s, v21.4s\n"
++      "zip2 v20.4s, v24.4s, v20.4s\n"
++      "zip1 v27.4s, v23.4s, v18.4s\n"
++      "zip1 v26.4s, v19.4s, v17.4s\n"
++      "zip2 v25.4s, v23.4s, v18.4s\n"
++      "zip2 v24.4s, v19.4s, v17.4s\n"
++      "zip1 v19.4s, v22.4s, v16.4s\n"
++      "zip1 v18.4s, v21.4s, v20.4s\n"
++      "zip1 v17.4s, v27.4s, v26.4s\n"
++      "zip2 v23.4s, v22.4s, v16.4s\n"
++      "zip1 v16.4s, v25.4s, v24.4s\n"
++      "zip2 v22.4s, v21.4s, v20.4s\n"
++      ".inst 0x0ea16a75  // bfcvtn v21.4h, v19.4s\n"
++      ".inst 0x0ea16a54  // bfcvtn v20.4h, v18.4s\n"
++      ".inst 0x0ea16a33  // bfcvtn v19.4h, v17.4s\n"
++      "zip2 v18.4s, v27.4s, v26.4s\n"
++      ".inst 0x0ea16a11  // bfcvtn v17.4h, v16.4s\n"
++      "zip2 v16.4s, v25.4s, v24.4s\n"
++      ".inst 0x4ea16af5  // bfcvtn2 v21.8h, v23.4s\n"
++      ".inst 0x4ea16ad4  // bfcvtn2 v20.8h, v22.4s\n"
++      ".inst 0x4ea16a53  // bfcvtn2 v19.8h, v18.4s\n"
++      ".inst 0x4ea16a11  // bfcvtn2 v17.8h, v16.4s\n"
++      "str q21, [x27, #0x0]\n"
++      "str q20, [x27, #0x10]\n"
++      "str q19, [x27, #0x20]\n"
++      "str q17, [x27, #0x30]\n"
++      "add x27, x27, %x[out_stride]\n"
++      "bge 4b\n"
++      "5:"  // Main row loop: Column loop skip
++      "cbz x28, 7f\n"
++      "movi v16.16b, #0x0\n"
++      "str q16, [x27, #0x0]\n"
++      "str q16, [x27, #0x10]\n"
++      "str q16, [x27, #0x20]\n"
++      "str q16, [x27, #0x30]\n"
++      "6:"  // Main row loop: width 1 loop: loop
++      "ldr s23, [x9], #0x4\n"
++      "ldr s22, [x26], #0x4\n"
++      "sub x28, x28, #0x1\n"
++      "ldr s19, [x25], #0x4\n"
++      "ldr s17, [x24], #0x4\n"
++      "cmp x28, #0x1\n"
++      "ldr s21, [x23], #0x4\n"
++      "ldr s20, [x22], #0x4\n"
++      "ldr s18, [x21], #0x4\n"
++      "ldr s16, [x20], #0x4\n"
++      "zip1 v19.4s, v23.4s, v19.4s\n"
++      "zip1 v17.4s, v22.4s, v17.4s\n"
++      "zip1 v18.4s, v21.4s, v18.4s\n"
++      "zip1 v16.4s, v20.4s, v16.4s\n"
++      "zip1 v17.4s, v19.4s, v17.4s\n"
++      "zip1 v16.4s, v18.4s, v16.4s\n"
++      ".inst 0x0ea16a31  // bfcvtn v17.4h, v17.4s\n"
++      ".inst 0x0ea16a10  // bfcvtn v16.4h, v16.4s\n"
++      "str d17, [x27, #0x0]\n"
++      "str d16, [x27, #0x20]\n"
++      "add x27, x27, #0x8\n"
++      "bge 6b\n"
++      "7:"  // Main row loop: odd col skip
++      "cmp %x[height], #0x8\n"
++      "add %x[out], %x[out], #0x40\n"
++      "bge 1b\n"
++      "cbz %x[height], 16f\n"
++      "8:"  // Main loop skip
++      "9:"  // Tail row loop: Head
++      "mov x9, %x[in]\n"
++      "mov x20, %x[width]\n"
++      "cmp %x[height], #0x3\n"
++      "mov x27, %x[out]\n"
++      "add x26, x9, %x[in_stride]\n"
++      "add x25, x26, %x[in_stride]\n"
++      "add x24, x25, %x[in_stride]\n"
++      "csel x25, x25, %x[pad_row], GE\n"
++      "add %x[in], x24, %x[in_stride]\n"
++      "csel x24, x24, %x[pad_row], GT\n"
++      "cmp %x[height], #0x1\n"
++      "sub %x[height], %x[height], #0x4\n"
++      "csel x26, x26, %x[pad_row], GT\n"
++      "cmp x20, #0x8\n"
++      "blt 11f\n"
++      "10:"  // Tail row loop: Unroll column loop
++      "ldr q25, [x9], #0x10\n"
++      "ldr q24, [x26], #0x10\n"
++      "sub x20, x20, #0x8\n"
++      "ldr q21, [x25], #0x10\n"
++      "ldr q20, [x24], #0x10\n"
++      "cmp x20, #0x8\n"
++      "ldr q23, [x9], #0x10\n"
++      "ldr q19, [x26], #0x10\n"
++      "ldr q18, [x25], #0x10\n"
++      "ldr q17, [x24], #0x10\n"
++      "zip1 v22.4s, v25.4s, v21.4s\n"
++      "zip1 v16.4s, v24.4s, v20.4s\n"
++      "zip2 v21.4s, v25.4s, v21.4s\n"
++      "zip2 v20.4s, v24.4s, v20.4s\n"
++      "zip1 v27.4s, v23.4s, v18.4s\n"
++      "zip1 v26.4s, v19.4s, v17.4s\n"
++      "zip2 v25.4s, v23.4s, v18.4s\n"
++      "zip2 v24.4s, v19.4s, v17.4s\n"
++      "zip1 v19.4s, v22.4s, v16.4s\n"
++      "zip1 v18.4s, v21.4s, v20.4s\n"
++      "zip1 v17.4s, v27.4s, v26.4s\n"
++      "zip2 v23.4s, v22.4s, v16.4s\n"
++      "zip1 v16.4s, v25.4s, v24.4s\n"
++      "zip2 v22.4s, v21.4s, v20.4s\n"
++      ".inst 0x0ea16a75  // bfcvtn v21.4h, v19.4s\n"
++      ".inst 0x0ea16a54  // bfcvtn v20.4h, v18.4s\n"
++      ".inst 0x0ea16a33  // bfcvtn v19.4h, v17.4s\n"
++      "zip2 v18.4s, v27.4s, v26.4s\n"
++      ".inst 0x0ea16a11  // bfcvtn v17.4h, v16.4s\n"
++      "zip2 v16.4s, v25.4s, v24.4s\n"
++      ".inst 0x4ea16af5  // bfcvtn2 v21.8h, v23.4s\n"
++      ".inst 0x4ea16ad4  // bfcvtn2 v20.8h, v22.4s\n"
++      ".inst 0x4ea16a53  // bfcvtn2 v19.8h, v18.4s\n"
++      ".inst 0x4ea16a11  // bfcvtn2 v17.8h, v16.4s\n"
++      "str q21, [x27, #0x0]\n"
++      "str q20, [x27, #0x10]\n"
++      "add x27, x27, %x[out_stride]\n"
++      "str q19, [x27, #0x0]\n"
++      "str q17, [x27, #0x10]\n"
++      "add x27, x27, %x[out_stride]\n"
++      "bge 10b\n"
++      "11:"  // Tail row loop: Unroll column loop skip
++      "cmp x20, #0x4\n"
++      "blt 13f\n"
++      "12:"  // Tail row loop: Column loop
++      "ldr q21, [x9], #0x10\n"
++      "ldr q20, [x26], #0x10\n"
++      "sub x20, x20, #0x4\n"
++      "ldr q19, [x25], #0x10\n"
++      "ldr q17, [x24], #0x10\n"
++      "cmp x20, #0x4\n"
++      "zip1 v18.4s, v21.4s, v19.4s\n"
++      "zip1 v16.4s, v20.4s, v17.4s\n"
++      "zip2 v21.4s, v21.4s, v19.4s\n"
++      "zip2 v20.4s, v20.4s, v17.4s\n"
++      "zip1 v17.4s, v18.4s, v16.4s\n"
++      "zip2 v19.4s, v18.4s, v16.4s\n"
++      "zip1 v16.4s, v21.4s, v20.4s\n"
++      ".inst 0x0ea16a32  // bfcvtn v18.4h, v17.4s\n"
++      "zip2 v17.4s, v21.4s, v20.4s\n"
++      ".inst 0x0ea16a10  // bfcvtn v16.4h, v16.4s\n"
++      ".inst 0x4ea16a72  // bfcvtn2 v18.8h, v19.4s\n"
++      ".inst 0x4ea16a30  // bfcvtn2 v16.8h, v17.4s\n"
++      "str q18, [x27, #0x0]\n"
++      "str q16, [x27, #0x10]\n"
++      "add x27, x27, %x[out_stride]\n"
++      "bge 12b\n"
++      "13:"  // Tail row loop: Column loop skip
++      "cbz x20, 15f\n"
++      "movi v16.16b, #0x0\n"
++      "str q16, [x27, #0x0]\n"
++      "str q16, [x27, #0x10]\n"
++      "14:"  // Tail row loop: width 1 loop: loop
++      "ldr s19, [x9], #0x4\n"
++      "ldr s18, [x26], #0x4\n"
++      "sub x20, x20, #0x1\n"
++      "ldr s17, [x25], #0x4\n"
++      "ldr s16, [x24], #0x4\n"
++      "cmp x20, #0x1\n"
++      "zip1 v17.4s, v19.4s, v17.4s\n"
++      "zip1 v16.4s, v18.4s, v16.4s\n"
++      "zip1 v16.4s, v17.4s, v16.4s\n"
++      ".inst 0x0ea16a10  // bfcvtn v16.4h, v16.4s\n"
++      "str d16, [x27, #0x0]\n"
++      "add x27, x27, #0x8\n"
++      "bge 14b\n"
++      "15:"  // Tail row loop: odd col skip
++      "cmp %x[height], #0x1\n"
++      "add %x[out], %x[out], #0x20\n"
++      "bge 9b\n"
++      "16:"  // Done
++      : [height] "+&r" (height), [in] "+&r" (in), [out] "+&r" (out)
++      : [in_stride] "r" (in_stride), [out_stride] "r" (out_stride), [pad_row] "r" (pad_row), [width] "r" (width)
++      : "cc", "memory", "v0", "v1", "v2", "v3", "v4", "v5", "v6", "v7", "v8", "v16", "v17", "v18", "v19", "v20", "v21", "v22", "v23", "v24", "v25", "v26", "v27", "v28", "v29", "v30", "v31", "x9", "x20", "x21", "x22", "x23", "x24", "x25", "x26", "x27", "x28"
++    );
++}
++
++} // anonymous namespace
++template<>
++void Transform<4, 4, true, VLType::None>(
++    bfloat16 *out, const float *in, int stride, int x0, int xmax, int k0, int kmax)
++{
++    a64_transpose_interleave_4_2x4_fp32bf16(
++        out,
++        in + k0 * stride + x0,
++        (xmax-x0),
++        stride * sizeof(float),
++        (kmax-k0)
++    );
++}
++
++
++#endif  // defined(__aarch64__)
+diff --git a/src/core/NEON/kernels/arm_gemm/transforms/list-sve.hpp b/src/core/NEON/kernels/arm_gemm/transforms/list-sve.hpp
+index c066c01..4f5ae0b 100644
+--- a/src/core/NEON/kernels/arm_gemm/transforms/list-sve.hpp
++++ b/src/core/NEON/kernels/arm_gemm/transforms/list-sve.hpp
+@@ -1,5 +1,5 @@
+ /*
+- * Copyright (c) 2021-2022 Arm Limited.
++ * Copyright (c) 2021-2023 Arm Limited.
+  *
+  * SPDX-License-Identifier: MIT
+  *
+@@ -42,6 +42,7 @@
+ #include "sve_transpose_interleave_12VL_2x4_fp32bf16.hpp"
+ #include "sve_transpose_interleave_1VL_1x4.hpp"
+ #include "sve_transpose_interleave_1VL.hpp"
++#include "sve_transpose_interleave_2VL_2x4_fp32bf16.hpp"
+ #include "sve_transpose_interleave_3VL_1x4.hpp"
+ #include "sve_transpose_interleave_3VL_2x2.hpp"
+ #include "sve_transpose_interleave_3VL.hpp"
+diff --git a/src/core/NEON/kernels/arm_gemm/transforms/list.hpp b/src/core/NEON/kernels/arm_gemm/transforms/list.hpp
+index adbaa6c..a174820 100644
+--- a/src/core/NEON/kernels/arm_gemm/transforms/list.hpp
++++ b/src/core/NEON/kernels/arm_gemm/transforms/list.hpp
+@@ -1,5 +1,5 @@
+ /*
+- * Copyright (c) 2020 Arm Limited.
++ * Copyright (c) 2020,2023 Arm Limited.
+  *
+  * SPDX-License-Identifier: MIT
+  *
+@@ -44,6 +44,7 @@
+ #include "a64_transpose_interleave_32_2x2.hpp"
+ #include "a64_transpose_interleave_4_1x16.hpp"
+ #include "a64_transpose_interleave_4_1x4.hpp"
++#include "a64_transpose_interleave_4_2x4_fp32bf16.hpp"
+ #include "a64_transpose_interleave_48.hpp"
+ #include "a64_transpose_interleave_64.hpp"
+ #include "a64_transpose_interleave_96.hpp"
+diff --git a/src/core/NEON/kernels/arm_gemm/transforms/sve_transpose_interleave_2VL_2x4_fp32bf16.hpp b/src/core/NEON/kernels/arm_gemm/transforms/sve_transpose_interleave_2VL_2x4_fp32bf16.hpp
+new file mode 100644
+index 0000000..ab0a28e
+--- /dev/null
++++ b/src/core/NEON/kernels/arm_gemm/transforms/sve_transpose_interleave_2VL_2x4_fp32bf16.hpp
+@@ -0,0 +1,149 @@
++/*
++ * Copyright (c) 2023 Arm Limited.
++ *
++ * SPDX-License-Identifier: MIT
++ *
++ * Permission is hereby granted, free of charge, to any person obtaining a copy
++ * of this software and associated documentation files (the "Software"), to
++ * deal in the Software without restriction, including without limitation the
++ * rights to use, copy, modify, merge, publish, distribute, sublicense, and/or
++ * sell copies of the Software, and to permit persons to whom the Software is
++ * furnished to do so, subject to the following conditions:
++ *
++ * The above copyright notice and this permission notice shall be included in all
++ * copies or substantial portions of the Software.
++ *
++ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
++ * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
++ * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
++ * AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
++ * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
++ * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
++ * SOFTWARE.
++ */
++
++#pragma once
++
++#if defined(ARM_COMPUTE_ENABLE_SVE)
++
++namespace {
++
++void sve_transpose_interleave_2VL_2x4_fp32bf16(bfloat16 *out, const float *in, size_t width, size_t in_stride, size_t height)
++{
++    float *pad_row = reinterpret_cast<float *>(alloca(width * sizeof(float)));
++
++    if (height % 4) {
++        memset(pad_row, 0, width * sizeof(float));
++    }
++
++    size_t out_stride = 2 * roundup<size_t>(height, 4) * get_vector_length<uint32_t>();
++
++    __asm__ __volatile__(
++      "ptrue p1.b\n"
++      "1:"  // Main row loop: Head
++      "mov x26, %x[in]\n"
++      "mov x25, %x[width]\n"
++      "cnth x24\n"
++      "cmp %x[height], #0x3\n"
++      "mov x23, %x[out]\n"
++      "add x22, x26, %x[in_stride]\n"
++      "add x21, x22, %x[in_stride]\n"
++      "add x20, x21, %x[in_stride]\n"
++      "add %x[in], x20, %x[in_stride]\n"
++      "csel x20, x20, %x[pad_row], GT\n"
++      "csel x21, x21, %x[pad_row], GE\n"
++      "cmp %x[height], #0x1\n"
++      "csel x22, x22, %x[pad_row], GT\n"
++      "cmp x25, x24\n"
++      "sub %x[height], %x[height], #0x4\n"
++      "blt 3f\n"
++      "2:"  // Main row loop: Unroll column loop
++      "ld1w { z18.s }, p1/Z, [x26]\n"
++      "ld1w { z17.s }, p1/Z, [x21]\n"
++      "sub x25, x25, x24\n"
++      "ld1w { z21.s }, p1/Z, [x26, #1, MUL VL]\n"
++      "ld1w { z16.s }, p1/Z, [x21, #1, MUL VL]\n"
++      "cmp x25, x24\n"
++      "addvl x26, x26, #2\n"
++      "ld1w { z26.s }, p1/Z, [x22]\n"
++      "ld1w { z20.s }, p1/Z, [x20]\n"
++      "addvl x21, x21, #2\n"
++      "zip1 z19.s, z18.s, z17.s\n"
++      "zip2 z18.s, z18.s, z17.s\n"
++      "ld1w { z25.s }, p1/Z, [x22, #1, MUL VL]\n"
++      "ld1w { z24.s }, p1/Z, [x20, #1, MUL VL]\n"
++      "addvl x22, x22, #2\n"
++      "zip1 z17.s, z21.s, z16.s\n"
++      "zip2 z16.s, z21.s, z16.s\n"
++      "addvl x20, x20, #2\n"
++      ".inst 0x658aa677  // bfcvt z23.h, p1/M, z19.s\n"
++      "zip1 z22.s, z26.s, z20.s\n"
++      ".inst 0x658aa655  // bfcvt z21.h, p1/M, z18.s\n"
++      "zip2 z20.s, z26.s, z20.s\n"
++      ".inst 0x658aa633  // bfcvt z19.h, p1/M, z17.s\n"
++      "zip1 z18.s, z25.s, z24.s\n"
++      ".inst 0x658aa611  // bfcvt z17.h, p1/M, z16.s\n"
++      "zip2 z16.s, z25.s, z24.s\n"
++      ".inst 0x648aa6d7  // bfcvtnt z23.h, p1/M, z22.s\n"
++      ".inst 0x648aa695  // bfcvtnt z21.h, p1/M, z20.s\n"
++      ".inst 0x648aa653  // bfcvtnt z19.h, p1/M, z18.s\n"
++      ".inst 0x648aa611  // bfcvtnt z17.h, p1/M, z16.s\n"
++      "st1h { z23.h }, p1, [x23]\n"
++      "st1h { z21.h }, p1, [x23, #1, MUL VL]\n"
++      "add x23, x23, %x[out_stride]\n"
++      "st1h { z19.h }, p1, [x23]\n"
++      "st1h { z17.h }, p1, [x23, #1, MUL VL]\n"
++      "add x23, x23, %x[out_stride]\n"
++      "bge 2b\n"
++      "3:"  // Main row loop: Unroll column loop skip
++      "cbz x25, 5f\n"
++      "4:"  // Main row loop: Column loop
++      "whilelt p0.s, XZR, x25\n"
++      "decd x25, ALL, MUL #2\n"
++      "ld1w { z19.s }, p0/Z, [x26]\n"
++      "addvl x26, x26, #1\n"
++      "ld1w { z16.s }, p0/Z, [x21]\n"
++      "addvl x21, x21, #1\n"
++      "ld1w { z20.s }, p0/Z, [x22]\n"
++      "addvl x22, x22, #1\n"
++      "ld1w { z18.s }, p0/Z, [x20]\n"
++      "addvl x20, x20, #1\n"
++      "cmp x25, #0x0\n"
++      "zip1 z17.s, z19.s, z16.s\n"
++      "zip2 z16.s, z19.s, z16.s\n"
++      "zip1 z19.s, z20.s, z18.s\n"
++      "zip2 z18.s, z20.s, z18.s\n"
++      ".inst 0x658aa631  // bfcvt z17.h, p1/M, z17.s\n"
++      ".inst 0x658aa610  // bfcvt z16.h, p1/M, z16.s\n"
++      ".inst 0x648aa671  // bfcvtnt z17.h, p1/M, z19.s\n"
++      ".inst 0x648aa650  // bfcvtnt z16.h, p1/M, z18.s\n"
++      "st1h { z17.h }, p1, [x23]\n"
++      "st1h { z16.h }, p1, [x23, #1, MUL VL]\n"
++      "add x23, x23, %x[out_stride]\n"
++      "bgt 4b\n"
++      "5:"  // Main row loop: Column loop skip
++      "cmp %x[height], #0x1\n"
++      "addvl %x[out], %x[out], #2\n"
++      "bge 1b\n"
++      : [height] "+&r" (height), [in] "+&r" (in), [out] "+&r" (out)
++      : [in_stride] "r" (in_stride), [out_stride] "r" (out_stride), [pad_row] "r" (pad_row), [width] "r" (width)
++      : "cc", "memory", "p0", "p1", "x20", "x21", "x22", "x23", "x24", "x25", "x26", "z16", "z17", "z18", "z19", "z20", "z21", "z22", "z23", "z24", "z25", "z26"
++    );
++}
++
++} // anonymous namespace
++template<>
++void Transform<2, 4, true, VLType::SVE>(
++    bfloat16 *out, const float *in, int stride, int x0, int xmax, int k0, int kmax)
++{
++    sve_transpose_interleave_2VL_2x4_fp32bf16(
++        out,
++        in + k0 * stride + x0,
++        (xmax-x0),
++        stride * sizeof(float),
++        (kmax-k0)
++    );
++}
++
++
++#endif  // defined(ARM_COMPUTE_ENABLE_SVE)
